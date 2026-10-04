@@ -1,0 +1,276 @@
+/*
+ * MILTALK SIM - RECEIVER (stands in for the testing kit)
+ * Receives centroids over ESP-NOW, saves them to flash,
+ * then classifies simulated camera frames with the real pipeline
+ * and points the servo: LEFT = A (recyclable), RIGHT = B (non-recyclable),
+ * CENTER = unsure.
+ */
+#include <WiFi.h>
+#include <esp_now.h>
+#include <ESP32Servo.h>
+#include <Preferences.h>
+
+// ================= SHARED (identical in both sketches) =================
+#define PROTO_VERSION 1
+#define MAGIC      0xBEEF
+#define PKT_CHUNK  1
+#define PKT_ACK    2
+#define CHUNK_DATA 200
+
+#define FRAME_W 160
+#define FRAME_H 120
+#define FEAT_W  16
+#define FEAT_H  16
+#define FEAT_LEN (FEAT_W * FEAT_H)
+
+typedef struct __attribute__((packed)) {
+  uint16_t magic; uint8_t type; uint8_t transferId;
+  uint8_t seq; uint8_t total; uint16_t len;
+  uint32_t crc;
+  uint8_t data[CHUNK_DATA];
+} ChunkPacket;
+
+typedef struct __attribute__((packed)) {
+  uint16_t magic; uint8_t type; uint8_t transferId; uint8_t seq;
+} AckPacket;
+
+typedef struct __attribute__((packed)) {
+  uint16_t version; uint16_t featLen; uint16_t countA; uint16_t countB;
+  float centroidA[FEAT_LEN];
+  float centroidB[FEAT_LEN];
+} WeightsPayload;
+
+uint32_t crc32(const uint8_t* d, size_t n) {
+  uint32_t c = 0xFFFFFFFF;
+  for (size_t i = 0; i < n; i++) {
+    c ^= d[i];
+    for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320 & -(c & 1));
+  }
+  return ~c;
+}
+
+uint8_t frame[FRAME_W * FRAME_H];
+void fakeCapture(int side) {
+  int bg  = 60 + random(-15, 16);
+  int cx  = (side == 0 ? 45 : side == 1 ? 115 : 80) + random(-12, 13);
+  int cy  = 60 + random(-15, 16);
+  int r   = 25 + random(-6, 7);
+  int obj = 200 + random(-30, 31);
+  for (int y = 0; y < FRAME_H; y++) {
+    for (int x = 0; x < FRAME_W; x++) {
+      int dx = x - cx, dy = y - cy;
+      int v = (dx * dx + dy * dy <= r * r) ? obj : bg;
+      v += random(-10, 11);
+      frame[y * FRAME_W + x] = constrain(v, 0, 255);
+    }
+  }
+}
+
+void extractFeatures(float* out) {
+  int blockW = FRAME_W / FEAT_W; if (blockW < 1) blockW = 1;
+  int blockH = FRAME_H / FEAT_H; if (blockH < 1) blockH = 1;
+  for (int fy = 0; fy < FEAT_H; fy++) {
+    for (int fx = 0; fx < FEAT_W; fx++) {
+      long sum = 0; int n = 0;
+      for (int by = 0; by < blockH; by++) {
+        for (int bx = 0; bx < blockW; bx++) {
+          int sx = fx * blockW + bx, sy = fy * blockH + by;
+          if (sx < FRAME_W && sy < FRAME_H) { sum += frame[sy * FRAME_W + sx]; n++; }
+        }
+      }
+      out[fy * FEAT_W + fx] = (n > 0) ? ((float)sum / n) / 255.0f : 0.0f;
+    }
+  }
+  float mean = 0;
+  for (int i = 0; i < FEAT_LEN; i++) mean += out[i];
+  mean /= FEAT_LEN;
+  for (int i = 0; i < FEAT_LEN; i++) out[i] -= mean;
+}
+// ======================================================================
+
+#define SERVO_PIN    18
+#define BTN_SIM      0      // BOOT = random simulated object
+#define LED_PIN      2      // on = weights loaded
+#define ANGLE_LEFT   30     // A = recyclable
+#define ANGLE_CENTER 90     // unsure / idle
+#define ANGLE_RIGHT  150    // B = non-recyclable
+#define UNSURE_CONF  10     // below this % confidence, don't commit
+
+Servo servo;
+Preferences prefs;
+uint8_t broadcastAddr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// Reassembly state (written inside the ESP-NOW callback)
+uint8_t rxBuf[sizeof(WeightsPayload)];
+bool gotChunk[16];
+uint8_t rxId = 0, rxTotal = 0;
+uint32_t rxCrc = 0;
+volatile unsigned long rxStartMs = 0;
+volatile bool transferDone = false;
+
+WeightsPayload weights;
+bool haveWeights = false;
+unsigned long servoReturnAt = 0;
+
+// ---------- ESP-NOW receive ----------
+void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (len != sizeof(ChunkPacket)) return;
+  const ChunkPacket* p = (const ChunkPacket*)data;
+  if (p->magic != MAGIC || p->type != PKT_CHUNK) return;
+  if (p->total > 16 || p->seq >= p->total) return;
+  size_t off = (size_t)p->seq * CHUNK_DATA;
+  if (off + p->len > sizeof(rxBuf)) return;
+
+  if (p->transferId != rxId || p->crc != rxCrc) {   // new transfer
+    rxId = p->transferId; rxTotal = p->total; rxCrc = p->crc;
+    memset(gotChunk, 0, sizeof(gotChunk));
+    rxStartMs = millis();
+  }
+  memcpy(rxBuf + off, p->data, p->len);
+  gotChunk[p->seq] = true;
+
+  AckPacket a = {MAGIC, PKT_ACK, p->transferId, p->seq};
+  esp_now_send(broadcastAddr, (uint8_t*)&a, sizeof(a));
+
+  bool all = true;
+  for (int i = 0; i < rxTotal; i++) if (!gotChunk[i]) { all = false; break; }
+  if (all) transferDone = true;
+}
+
+// ---------- flash storage ----------
+bool payloadValid(const WeightsPayload& w) {
+  return w.version == PROTO_VERSION && w.featLen == FEAT_LEN && w.countA > 0 && w.countB > 0;
+}
+
+void saveWeights() {
+  prefs.begin("miltalk", false);
+  prefs.putBytes("w", &weights, sizeof(weights));
+  prefs.end();
+}
+
+bool loadWeights() {
+  if (!prefs.begin("miltalk", true)) return false;
+  bool ok = false;
+  if (prefs.isKey("w") && prefs.getBytesLength("w") == sizeof(weights)) {
+    prefs.getBytes("w", &weights, sizeof(weights));
+    ok = payloadValid(weights);
+  }
+  prefs.end();
+  return ok;
+}
+
+void clearWeights() {
+  prefs.begin("miltalk", false);
+  prefs.remove("w");
+  prefs.end();
+  haveWeights = false;
+  digitalWrite(LED_PIN, LOW);
+  Serial.println("Saved weights cleared.");
+}
+
+// ---------- classification (mirrors the real testExample) ----------
+float distToCentroid(const float* feat, const float* c) {
+  float d = 0;
+  for (int i = 0; i < FEAT_LEN; i++) { float x = feat[i] - c[i]; d += x * x; }
+  return sqrtf(d);
+}
+
+void testObject(int side) {
+  if (!haveWeights) { Serial.println("No weights yet - press BOOT on the sender."); return; }
+
+  float feat[FEAT_LEN];
+  fakeCapture(side);          // <- later: real esp_camera_fb_get()
+  extractFeatures(feat);
+
+  float dA = distToCentroid(feat, weights.centroidA);
+  float dB = distToCentroid(feat, weights.centroidB);
+  bool aWins = dA < dB;
+  float nr = aWins ? dA : dB, fr = aWins ? dB : dA;
+  float conf = (fr + nr > 0) ? (fr - nr) / (fr + nr) * 100.0f : 0;
+
+  const char* shown = side == 0 ? "recyclable-like" : side == 1 ? "non-recyclable-like" : "ambiguous";
+  if (conf < UNSURE_CONF) {
+    Serial.printf("[%s] dA=%.3f dB=%.3f conf=%.0f%% -> UNSURE, servo CENTER\n", shown, dA, dB, conf);
+    servo.write(ANGLE_CENTER);
+  } else {
+    Serial.printf("[%s] dA=%.3f dB=%.3f conf=%.0f%% -> %s, servo %s\n", shown, dA, dB, conf,
+                  aWins ? "A RECYCLABLE" : "B NON-RECYCLABLE", aWins ? "LEFT" : "RIGHT");
+    servo.write(aWins ? ANGLE_LEFT : ANGLE_RIGHT);
+  }
+  servoReturnAt = millis() + 2000;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  pinMode(BTN_SIM, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  randomSeed(esp_random());
+
+  ESP32PWM::allocateTimer(1);   // timer 0 left free for the camera later
+  ESP32PWM::allocateTimer(2);
+  servo.setPeriodHertz(50);
+  servo.attach(SERVO_PIN, 500, 2400);
+  servo.write(ANGLE_CENTER);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    while (true) delay(1000);
+  }
+  esp_now_register_recv_cb(onRecv);
+
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, broadcastAddr, 6);
+  peer.channel = 0;
+  peer.encrypt = false;
+  esp_now_add_peer(&peer);
+
+  haveWeights = loadWeights();
+  digitalWrite(LED_PIN, haveWeights ? HIGH : LOW);
+  if (haveWeights) Serial.printf("Loaded saved weights (A:%d B:%d)\n", weights.countA, weights.countB);
+  else             Serial.println("No saved weights. Waiting for sender...");
+  Serial.println("Commands: a = recyclable-like, b = non-recyclable-like, c = ambiguous, x = clear");
+}
+
+void loop() {
+  if (transferDone) {
+    transferDone = false;
+    unsigned long took = millis() - rxStartMs;
+    WeightsPayload incoming;
+    if (crc32(rxBuf, sizeof(rxBuf)) == rxCrc) {
+      memcpy(&incoming, rxBuf, sizeof(incoming));
+      if (payloadValid(incoming)) {
+        weights = incoming;
+        haveWeights = true;
+        saveWeights();
+        digitalWrite(LED_PIN, HIGH);
+        Serial.printf("Weights received in %lu ms (A:%d B:%d) - saved to flash\n",
+                      took, weights.countA, weights.countB);
+      } else {
+        Serial.println("Payload rejected (wrong version or size)");
+      }
+    } else {
+      Serial.println("CRC mismatch - waiting for resend");
+    }
+  }
+
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'a') testObject(0);
+    else if (c == 'b') testObject(1);
+    else if (c == 'c') testObject(2);
+    else if (c == 'x') clearWeights();
+  }
+
+  if (digitalRead(BTN_SIM) == LOW) {
+    testObject(random(3));
+    while (digitalRead(BTN_SIM) == LOW) delay(5);
+  }
+
+  if (servoReturnAt && millis() > servoReturnAt) {
+    servo.write(ANGLE_CENTER);
+    servoReturnAt = 0;
+  }
+}
