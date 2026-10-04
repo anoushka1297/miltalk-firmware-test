@@ -1,0 +1,232 @@
+/*
+ * MILTALK SIM - SENDER (stands in for the training kit)
+ * Simulates: fake camera -> real feature extraction -> real training sums
+ * Sends centroids over ESP-NOW (broadcast, chunked, acked, CRC-checked)
+ * Short BOOT = send (stands in for the 4-button combo), long BOOT = retrain
+ */
+#include <WiFi.h>
+#include <esp_now.h>
+
+// ================= SHARED (identical in both sketches) =================
+#define PROTO_VERSION 1
+#define MAGIC      0xBEEF
+#define PKT_CHUNK  1
+#define PKT_ACK    2
+#define CHUNK_DATA 200
+
+#define FRAME_W 160
+#define FRAME_H 120
+#define FEAT_W  16
+#define FEAT_H  16
+#define FEAT_LEN (FEAT_W * FEAT_H)
+
+typedef struct __attribute__((packed)) {
+  uint16_t magic; uint8_t type; uint8_t transferId;
+  uint8_t seq; uint8_t total; uint16_t len;
+  uint32_t crc;
+  uint8_t data[CHUNK_DATA];
+} ChunkPacket;
+
+typedef struct __attribute__((packed)) {
+  uint16_t magic; uint8_t type; uint8_t transferId; uint8_t seq;
+} AckPacket;
+
+typedef struct __attribute__((packed)) {
+  uint16_t version; uint16_t featLen; uint16_t countA; uint16_t countB;
+  float centroidA[FEAT_LEN];
+  float centroidB[FEAT_LEN];
+} WeightsPayload;
+
+uint32_t crc32(const uint8_t* d, size_t n) {
+  uint32_t c = 0xFFFFFFFF;
+  for (size_t i = 0; i < n; i++) {
+    c ^= d[i];
+    for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320 & -(c & 1));
+  }
+  return ~c;
+}
+
+// Fake camera: grey background + bright object. side: 0=left(A) 1=right(B) 2=center
+uint8_t frame[FRAME_W * FRAME_H];
+void fakeCapture(int side) {
+  int bg  = 60 + random(-15, 16);
+  int cx  = (side == 0 ? 45 : side == 1 ? 115 : 80) + random(-12, 13);
+  int cy  = 60 + random(-15, 16);
+  int r   = 25 + random(-6, 7);
+  int obj = 200 + random(-30, 31);
+  for (int y = 0; y < FRAME_H; y++) {
+    for (int x = 0; x < FRAME_W; x++) {
+      int dx = x - cx, dy = y - cy;
+      int v = (dx * dx + dy * dy <= r * r) ? obj : bg;
+      v += random(-10, 11);
+      frame[y * FRAME_W + x] = constrain(v, 0, 255);
+    }
+  }
+}
+
+// Same feature extraction as the real firmware's captureFeatures()
+void extractFeatures(float* out) {
+  int blockW = FRAME_W / FEAT_W; if (blockW < 1) blockW = 1;
+  int blockH = FRAME_H / FEAT_H; if (blockH < 1) blockH = 1;
+  for (int fy = 0; fy < FEAT_H; fy++) {
+    for (int fx = 0; fx < FEAT_W; fx++) {
+      long sum = 0; int n = 0;
+      for (int by = 0; by < blockH; by++) {
+        for (int bx = 0; bx < blockW; bx++) {
+          int sx = fx * blockW + bx, sy = fy * blockH + by;
+          if (sx < FRAME_W && sy < FRAME_H) { sum += frame[sy * FRAME_W + sx]; n++; }
+        }
+      }
+      out[fy * FEAT_W + fx] = (n > 0) ? ((float)sum / n) / 255.0f : 0.0f;
+    }
+  }
+  float mean = 0;
+  for (int i = 0; i < FEAT_LEN; i++) mean += out[i];
+  mean /= FEAT_LEN;
+  for (int i = 0; i < FEAT_LEN; i++) out[i] -= mean;
+}
+// ======================================================================
+
+#define BTN_SEND 0       // BOOT button
+#define LED_PIN  2       // onboard LED (if your board has one)
+#define MAX_EXAMPLES 20
+
+uint8_t broadcastAddr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// Training state - same structure as the real kit
+float sumA[FEAT_LEN], sumB[FEAT_LEN];
+int countA = 0, countB = 0;
+
+WeightsPayload payload;
+uint8_t transferId = 0;
+volatile int lastAckSeq = -1;
+volatile uint8_t lastAckId = 0;
+
+void blink(int times, int onMs) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_PIN, HIGH); delay(onMs);
+    digitalWrite(LED_PIN, LOW);  delay(150);
+  }
+}
+
+void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (len != sizeof(AckPacket)) return;
+  const AckPacket* a = (const AckPacket*)data;
+  if (a->magic != MAGIC || a->type != PKT_ACK) return;
+  lastAckId = a->transferId;
+  lastAckSeq = a->seq;
+}
+
+// ---------- training (mirrors the real trainExample) ----------
+void resetTraining() {
+  for (int i = 0; i < FEAT_LEN; i++) { sumA[i] = 0; sumB[i] = 0; }
+  countA = 0; countB = 0;
+}
+
+void trainExample(bool isClassA) {
+  if (isClassA && countA >= MAX_EXAMPLES) return;
+  if (!isClassA && countB >= MAX_EXAMPLES) return;
+  float feat[FEAT_LEN];
+  fakeCapture(isClassA ? 0 : 1);   // A = recyclable-like scene, B = non-recyclable-like
+  extractFeatures(feat);
+  if (isClassA) { for (int i = 0; i < FEAT_LEN; i++) sumA[i] += feat[i]; countA++; }
+  else          { for (int i = 0; i < FEAT_LEN; i++) sumB[i] += feat[i]; countB++; }
+}
+
+void simulateTrainingSession() {
+  resetTraining();
+  for (int i = 0; i < 12; i++) trainExample(true);
+  for (int i = 0; i < 15; i++) trainExample(false);
+  Serial.printf("Simulated training done: A=%d B=%d\n", countA, countB);
+}
+
+// ---------- sending ----------
+void buildPayload() {
+  payload.version = PROTO_VERSION;
+  payload.featLen = FEAT_LEN;
+  payload.countA = countA;
+  payload.countB = countB;
+  for (int i = 0; i < FEAT_LEN; i++) {
+    payload.centroidA[i] = sumA[i] / countA;   // centroid = average
+    payload.centroidB[i] = sumB[i] / countB;
+  }
+}
+
+bool sendWeights() {
+  if (countA == 0 || countB == 0) { Serial.println("Train both classes first"); return false; }
+  buildPayload();
+
+  const uint8_t* buf = (const uint8_t*)&payload;
+  size_t total = sizeof(payload);
+  uint8_t nChunks = (total + CHUNK_DATA - 1) / CHUNK_DATA;
+  uint32_t crc = crc32(buf, total);
+  transferId++;
+  if (transferId == 0) transferId = 1;
+  unsigned long t0 = millis();
+  Serial.printf("Sending %u bytes in %d chunks...\n", total, nChunks);
+
+  for (uint8_t seq = 0; seq < nChunks; seq++) {
+    ChunkPacket p;
+    p.magic = MAGIC; p.type = PKT_CHUNK; p.transferId = transferId;
+    p.seq = seq; p.total = nChunks; p.crc = crc;
+    size_t off = (size_t)seq * CHUNK_DATA;
+    p.len = min((size_t)CHUNK_DATA, total - off);
+    memcpy(p.data, buf + off, p.len);
+
+    bool acked = false;
+    for (int attempt = 0; attempt < 5 && !acked; attempt++) {
+      lastAckSeq = -1;
+      esp_now_send(broadcastAddr, (uint8_t*)&p, sizeof(p));
+      unsigned long ts = millis();
+      while (millis() - ts < 50) {
+        if (lastAckId == transferId && lastAckSeq == seq) { acked = true; break; }
+        delay(1);
+      }
+      if (!acked) Serial.printf("  chunk %d: no ack, retry %d\n", seq, attempt + 1);
+    }
+    if (!acked) { Serial.printf("FAILED at chunk %d\n", seq); return false; }
+  }
+  Serial.printf("Done: all chunks acked in %lu ms\n", millis() - t0);
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  pinMode(BTN_SEND, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  randomSeed(esp_random());
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    while (true) { blink(1, 100); }
+  }
+  esp_now_register_recv_cb(onRecv);
+
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, broadcastAddr, 6);
+  peer.channel = 0;
+  peer.encrypt = false;
+  esp_now_add_peer(&peer);
+
+  simulateTrainingSession();
+  blink(1, 300);   // ready
+  Serial.println("SENDER ready. Short BOOT = send, long BOOT (>1.5s) = retrain.");
+}
+
+void loop() {
+  if (digitalRead(BTN_SEND) == LOW) {
+    unsigned long t = millis();
+    while (digitalRead(BTN_SEND) == LOW) delay(5);
+    if (millis() - t > 1500) {
+      simulateTrainingSession();
+      blink(2, 400);                     // 2 slow = retrained
+    } else {
+      bool ok = sendWeights();
+      if (ok) blink(3, 150);             // 3 quick = sent OK
+      else    blink(1, 1500);            // 1 long = failed
+    }
+  }
+}
