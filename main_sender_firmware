@@ -1,0 +1,739 @@
+/*
+ * Miltalk CAMERA KIT - Classifier with TFT display + Feedback Learning
+ * Board: ESP32-S3 N16R8 CAM (onboard OV5640)
+ * Display: ST7735 TFT, mounted PORTRAIT (128 wide x 160 tall)
+ *
+ * Two tabs: HOME (avatar drifts in a circle + MILTALK), ML (train/test/reset).
+ * Switch tabs: hold BTN_A and BTN_B together.
+ *
+ * NEW - Feedback learning: after a TEST, the kit asks "Was this right?"
+ *   BTN_A = YES (approve: reinforce the predicted class)
+ *   BTN_B = NO  (correct it: learn as the other class)
+ *   TEST or RESET = skip feedback
+ *
+ * [ADDED] ESP-NOW weight transfer to the TESTER kit:
+ *   Hold ALL FOUR buttons (A + B + TEST + RESET) until "SENDING" appears.
+ *   Sends sumA/sumB/countA/countB. Any action accidentally triggered by the
+ *   first button of the combo is undone before sending.
+ *   Classification, camera, UI and single-button behaviour are unchanged.
+ *
+ * ARDUINO IDE SETTINGS:
+ *   Board: ESP32S3 Dev Module | PSRAM: OPI PSRAM | Flash: 16MB
+ *   Partition: Huge APP | USB CDC On Boot: Enabled
+ *   esp32 board package 3.x
+ * LIBRARIES: Adafruit GFX, Adafruit ST7735 and ST7789
+ */
+
+#include "esp_camera.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <SPI.h>
+#include <WiFi.h>        // [ADDED]
+#include <esp_now.h>     // [ADDED]
+
+// ----------------- CAMERA PIN MAP -----------------
+#define PWDN_GPIO_NUM   -1
+#define RESET_GPIO_NUM  -1
+#define XCLK_GPIO_NUM   15
+#define SIOD_GPIO_NUM    4
+#define SIOC_GPIO_NUM    5
+#define Y2_GPIO_NUM     11
+#define Y3_GPIO_NUM      9
+#define Y4_GPIO_NUM      8
+#define Y5_GPIO_NUM     10
+#define Y6_GPIO_NUM     12
+#define Y7_GPIO_NUM     18
+#define Y8_GPIO_NUM     17
+#define Y9_GPIO_NUM     16
+#define VSYNC_GPIO_NUM   6
+#define HREF_GPIO_NUM    7
+#define PCLK_GPIO_NUM   13
+
+// ----------------- TFT PINS -----------------
+#define TFT_CS    40
+#define TFT_RST   41
+#define TFT_DC    42
+#define TFT_MOSI  39
+#define TFT_SCLK  38
+// TFT VCC + BL -> 3V3, GND -> GND
+
+// ----------------- BUTTON PINS -----------------
+#define BTN_A     21
+#define BTN_B     47
+#define BTN_TEST  14
+#define BTN_RESET 1
+
+// ----------------- DISPLAY (PORTRAIT) -----------------
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
+#define SCR_W 128
+#define SCR_H 160
+
+#define COL_BG      0x18E3
+#define COL_ACCENT  0x055A
+#define COL_A       0x4A5F
+#define COL_B       0x05B4
+#define COL_TEST    0xFCA0
+#define COL_TEXT    0xFFFF
+#define COL_MUTE    0x8C71
+#define COL_GOOD    0x07E0
+#define COL_BAD     0xF800
+
+// ----------------- CLASSIFIER CONFIG -----------------
+#define FEAT_W 16
+#define FEAT_H 16
+#define FEAT_LEN (FEAT_W * FEAT_H)
+#define MAX_EXAMPLES 20
+
+float sumA[FEAT_LEN];
+float sumB[FEAT_LEN];
+int   countA = 0;
+int   countB = 0;
+
+String lastPrediction = "-";
+int    lastConfidence  = 0;
+
+// ----------------- FEEDBACK STATE -----------------
+bool  feedbackMode = false;      // true right after a TEST, waiting for approve/disprove
+char  predClass = 0;             // 'A' or 'B' - the class the kit last predicted
+float lastFeat[FEAT_LEN];        // feature vector from the last test, reused for learning
+
+// =================== [ADDED] ESP-NOW PROTOCOL (same in tester) ===================
+#define KIT_ID        1          // trainer and tester must match
+#define PROTO_VERSION 1
+#define PKT_MAGIC     0xBEEF
+#define PKT_CHUNK     1
+#define PKT_ACK       2
+#define CHUNK_DATA    200
+
+typedef struct __attribute__((packed)) {
+  uint16_t magic; uint8_t type; uint8_t kitId; uint8_t transferId;
+  uint8_t seq; uint8_t total; uint16_t len;
+  uint32_t crc;                  // CRC32 of the whole payload
+  uint8_t data[CHUNK_DATA];
+} ChunkPacket;
+
+typedef struct __attribute__((packed)) {
+  uint16_t magic; uint8_t type; uint8_t kitId; uint8_t transferId; uint8_t seq;
+} AckPacket;
+
+typedef struct __attribute__((packed)) {
+  uint16_t version; uint16_t featLen;
+  int32_t  countA;  int32_t  countB;
+  float sumA[FEAT_LEN];
+  float sumB[FEAT_LEN];
+} WeightsPayload;
+
+uint32_t crc32(const uint8_t* d, size_t n) {
+  uint32_t c = 0xFFFFFFFF;
+  for (size_t i = 0; i < n; i++) {
+    c ^= d[i];
+    for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320 & -(c & 1));
+  }
+  return ~c;
+}
+
+uint8_t broadcastAddr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+bool espNowReady = false;
+WeightsPayload txPayload;
+uint8_t txTransferId = 0;
+volatile int     lastAckSeq = -1;
+volatile uint8_t lastAckId  = 0;
+
+#define SEND_COMBO_WAIT_MS 150
+
+// Undo snapshot: protects training if the combo's first button fired an action
+float  snapSumA[FEAT_LEN], snapSumB[FEAT_LEN], snapLastFeat[FEAT_LEN];
+int    snapCountA = 0, snapCountB = 0, snapConf = 0;
+String snapPred = "-";
+bool   snapFeedback = false;
+char   snapPredClass = 0;
+bool   undoArmed = false;
+int    undoPin = -1;
+
+void armUndo(int pin) {
+  if (undoArmed) return;                     // keep the earliest snapshot
+  memcpy(snapSumA, sumA, sizeof(sumA));
+  memcpy(snapSumB, sumB, sizeof(sumB));
+  memcpy(snapLastFeat, lastFeat, sizeof(lastFeat));
+  snapCountA = countA; snapCountB = countB;
+  snapPred = lastPrediction; snapConf = lastConfidence;
+  snapFeedback = feedbackMode; snapPredClass = predClass;
+  undoArmed = true; undoPin = pin;
+}
+
+void restoreSnapshot() {
+  memcpy(sumA, snapSumA, sizeof(sumA));
+  memcpy(sumB, snapSumB, sizeof(sumB));
+  memcpy(lastFeat, snapLastFeat, sizeof(lastFeat));
+  countA = snapCountA; countB = snapCountB;
+  lastPrediction = snapPred; lastConfidence = snapConf;
+  feedbackMode = snapFeedback; predClass = snapPredClass;
+}
+// =================================================================================
+
+// ----------------- TABS -----------------
+enum Page { PAGE_HOME, PAGE_ML };
+Page currentPage = PAGE_HOME;
+
+// ----------------- BUTTON STATE -----------------
+unsigned long lastPress[49] = {0};
+const unsigned long DEBOUNCE_MS = 250;
+unsigned long lastComboSwitch = 0;
+const unsigned long COMBO_COOLDOWN_MS = 800;
+
+// ----------------- CAMERA INIT -----------------
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_GRAYSCALE;
+  config.frame_size = FRAMESIZE_QQVGA;
+  config.fb_count = 1;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init FAILED 0x%x\n", err);
+    return false;
+  }
+
+  sensor_t* s = esp_camera_sensor_get();
+  if (s) {
+    s->set_whitebal(s, 0);
+    s->set_awb_gain(s, 0);
+    s->set_exposure_ctrl(s, 0);
+    s->set_aec2(s, 0);
+    s->set_gain_ctrl(s, 0);
+    s->set_agc_gain(s, 5);
+    s->set_aec_value(s, 300);
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+  }
+  return true;
+}
+
+// ----------------- CAPTURE PREVIEW -----------------
+void drawFramePreview(camera_fb_t* fb) {
+  int srcW = fb->width, srcH = fb->height;   // 160 x 120
+  uint8_t* px = fb->buf;
+
+  int dstW = SCR_W;                          // 128
+  int dstH = (srcH * dstW) / srcW;           // ~96
+  int offsetY = (SCR_H - dstH) / 2;          // center vertically
+
+  tft.fillScreen(ST77XX_BLACK);
+
+  for (int dy = 0; dy < dstH; dy++) {
+    for (int dx = 0; dx < dstW; dx++) {
+      int sx = (dx * srcW) / dstW;
+      int sy = (dy * srcH) / dstH;
+      uint8_t g = px[sy * srcW + sx];        // 0-255 gray
+      uint16_t color = ((g & 0xF8) << 8) | ((g & 0xFC) << 3) | (g >> 3);
+      tft.drawPixel(dx, offsetY + dy, color);
+    }
+  }
+
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(4, 4);
+  tft.print("captured");
+}
+
+// ----------------- FEATURE EXTRACTION -----------------
+bool captureFeatures(float* out) {
+  for (int i = 0; i < 3; i++) {
+    camera_fb_t* tmp = esp_camera_fb_get();
+    if (tmp) esp_camera_fb_return(tmp);
+    delay(30);
+  }
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) { Serial.println("Capture FAILED"); return false; }
+
+  int srcW = fb->width, srcH = fb->height;
+  uint8_t* px = fb->buf;
+  int blockW = srcW / FEAT_W; if (blockW < 1) blockW = 1;
+  int blockH = srcH / FEAT_H; if (blockH < 1) blockH = 1;
+
+  for (int fy = 0; fy < FEAT_H; fy++) {
+    for (int fx = 0; fx < FEAT_W; fx++) {
+      long sum = 0; int n = 0;
+      for (int by = 0; by < blockH; by++) {
+        for (int bx = 0; bx < blockW; bx++) {
+          int sx = fx * blockW + bx;
+          int sy = fy * blockH + by;
+          if (sx < srcW && sy < srcH) { sum += px[sy * srcW + sx]; n++; }
+        }
+      }
+      float avg = (n > 0) ? (float)sum / n : 0.0f;
+      out[fy * FEAT_W + fx] = avg / 255.0f;
+    }
+  }
+  drawFramePreview(fb);   // show what the camera saw
+  delay(2000);            // hold 2 seconds
+  esp_camera_fb_return(fb);
+
+  float mean = 0;
+  for (int i = 0; i < FEAT_LEN; i++) mean += out[i];
+  mean /= FEAT_LEN;
+  for (int i = 0; i < FEAT_LEN; i++) out[i] -= mean;
+  return true;
+}
+
+// ----------------- CLASSIFIER -----------------
+void resetTraining() {
+  for (int i = 0; i < FEAT_LEN; i++) { sumA[i] = 0; sumB[i] = 0; }
+  countA = 0; countB = 0;
+  lastPrediction = "-"; lastConfidence = 0;
+  feedbackMode = false; predClass = 0;
+  Serial.println("=== RESET ===");
+}
+
+void trainExample(bool isClassA) {
+  if (isClassA && countA >= MAX_EXAMPLES) { Serial.println("A full"); return; }
+  if (!isClassA && countB >= MAX_EXAMPLES) { Serial.println("B full"); return; }
+  float feat[FEAT_LEN];
+  if (!captureFeatures(feat)) return;
+  if (isClassA) {
+    for (int i = 0; i < FEAT_LEN; i++) sumA[i] += feat[i];
+    countA++;
+    Serial.printf("Trained A: %d\n", countA);
+  } else {
+    for (int i = 0; i < FEAT_LEN; i++) sumB[i] += feat[i];
+    countB++;
+    Serial.printf("Trained B: %d\n", countB);
+  }
+}
+
+float distToCentroid(const float* feat, const float* sum, int count) {
+  if (count == 0) return 1e9;
+  float d = 0;
+  for (int i = 0; i < FEAT_LEN; i++) {
+    float c = sum[i] / count;
+    float diff = feat[i] - c;
+    d += diff * diff;
+  }
+  return sqrt(d);
+}
+
+void testExample() {
+  if (countA == 0 || countB == 0) {
+    lastPrediction = "train both"; lastConfidence = 0;
+    Serial.println("Train both A and B first.");
+    return;
+  }
+  if (!captureFeatures(lastFeat)) return;   // store into lastFeat for feedback reuse
+  float dA = distToCentroid(lastFeat, sumA, countA);
+  float dB = distToCentroid(lastFeat, sumB, countB);
+  bool aWins = dA < dB;
+  float nr = aWins ? dA : dB;
+  float fr = aWins ? dB : dA;
+  float conf = (fr + nr > 0) ? (fr - nr) / (fr + nr) * 100.0f : 0;
+  lastPrediction = aWins ? "SET A" : "SET B";
+  predClass = aWins ? 'A' : 'B';
+  lastConfidence = (int)conf;
+  Serial.printf("Predict %s (%.0f%%)\n", lastPrediction.c_str(), conf);
+  feedbackMode = true;   // enter feedback mode after a test
+}
+
+// ----------------- FEEDBACK LEARNING -----------------
+void learnFromFeedback(char cls) {
+  if (cls == 'A') {
+    if (countA < MAX_EXAMPLES) { for (int i = 0; i < FEAT_LEN; i++) sumA[i] += lastFeat[i]; countA++; }
+  } else {
+    if (countB < MAX_EXAMPLES) { for (int i = 0; i < FEAT_LEN; i++) sumB[i] += lastFeat[i]; countB++; }
+  }
+}
+
+void handleApprove() {
+  learnFromFeedback(predClass);   // right: reinforce predicted class
+  Serial.printf("Approved. Reinforced %c (A:%d B:%d)\n", predClass, countA, countB);
+  feedbackMode = false;
+}
+
+void handleDisprove() {
+  char correct = (predClass == 'A') ? 'B' : 'A';   // wrong: it was the other class
+  learnFromFeedback(correct);
+  Serial.printf("Corrected to %c (A:%d B:%d)\n", correct, countA, countB);
+  feedbackMode = false;
+}
+
+// ----------------- DISPLAY: ML PAGE -----------------
+void drawMLPage() {
+  tft.fillScreen(COL_BG);
+  tft.fillRect(0, 0, SCR_W, 18, COL_ACCENT);
+  tft.setTextColor(COL_TEXT);
+  tft.setTextSize(1);
+  tft.setCursor(6, 5);
+  tft.print("CAMERA KIT");
+
+  tft.setTextColor(COL_A);
+  tft.setCursor(6, 28);
+  tft.print("SET A: "); tft.print(countA);
+  tft.setTextColor(COL_B);
+  tft.setCursor(6, 42);
+  tft.print("SET B: "); tft.print(countB);
+
+  tft.drawRect(6, 62, SCR_W - 12, 46, COL_MUTE);
+  tft.setTextColor(COL_MUTE);
+  tft.setCursor(12, 68);
+  tft.print("PREDICTION");
+  tft.setTextColor(COL_TEXT);
+  tft.setTextSize(2);
+  tft.setCursor(12, 80);
+  tft.print(lastPrediction);
+  tft.setTextSize(1);
+  tft.setTextColor(COL_ACCENT);
+  tft.setCursor(12, 98);
+  tft.print(lastConfidence); tft.print("% conf");
+
+  if (feedbackMode) {
+    // Show the approve / disprove prompt instead of the normal controls
+    tft.setTextColor(COL_TEXT);
+    tft.setCursor(6, 120); tft.print("Was this right?");
+    tft.setTextColor(COL_GOOD); tft.setCursor(6, 132); tft.print("A = YES");
+    tft.setTextColor(COL_BAD);  tft.setCursor(6, 144); tft.print("B = NO (fix it)");
+  } else {
+    tft.setTextColor(COL_A);    tft.setCursor(6, 120); tft.print("A = train A");
+    tft.setTextColor(COL_B);    tft.setCursor(6, 132); tft.print("B = train B");
+    tft.setTextColor(COL_TEST); tft.setCursor(6, 144); tft.print("TEST / RESET");
+  }
+
+  tft.setTextColor(COL_MUTE);
+  tft.setCursor(6, SCR_H - 8);
+  tft.print("A+B = home");
+}
+
+// ----------------- DISPLAY: HOME PAGE (unchanged) -----------------
+float avatarAngle = 0;
+int lastAx = -1, lastAy = -1;
+
+void drawHomeStatic() {
+  tft.fillScreen(COL_BG);
+  tft.setTextColor(COL_ACCENT);
+  tft.setTextSize(2);
+  tft.setCursor((SCR_W - 84) / 2, 30);
+  tft.print("MILTALK");
+  tft.setTextSize(1);
+  tft.setTextColor(COL_MUTE);
+  tft.setCursor((SCR_W - 66) / 2, 52);
+  tft.print("camera kit");
+  tft.setTextColor(COL_MUTE);
+  tft.setCursor(6, SCR_H - 8);
+  tft.print("A+B = ML page");
+}
+
+void drawAvatar(int cx, int cy) {
+  if (lastAx >= 0) {
+    tft.fillCircle(lastAx, lastAy, 12, COL_BG);
+  }
+  tft.fillCircle(cx, cy, 10, COL_ACCENT);
+  tft.fillCircle(cx - 3, cy - 2, 2, COL_BG);
+  tft.fillCircle(cx + 3, cy - 2, 2, COL_BG);
+  tft.drawLine(cx - 4, cy + 4, cx, cy + 6, COL_BG);
+  tft.drawLine(cx, cy + 6, cx + 4, cy + 4, COL_BG);
+  lastAx = cx; lastAy = cy;
+}
+
+void animateHome() {
+  int pathCx = SCR_W / 2;
+  int pathCy = 110;
+  int radius = 30;
+  avatarAngle += 0.15;
+  if (avatarAngle > TWO_PI) avatarAngle -= TWO_PI;
+  int ax = pathCx + (int)(cos(avatarAngle) * radius);
+  int ay = pathCy + (int)(sin(avatarAngle) * radius);
+  drawAvatar(ax, ay);
+}
+
+// ----------------- BUTTON HANDLING -----------------
+bool isDown(int pin) { return digitalRead(pin) == LOW; }
+
+bool prevA = false, prevB = false, prevTest = false, prevReset = false;
+
+bool justPressed(int pin, bool &prev) {
+  bool down = isDown(pin);
+  bool edge = false;
+  unsigned long now = millis();
+  if (down && !prev && (now - lastPress[pin] > DEBOUNCE_MS)) {
+    lastPress[pin] = now;
+    edge = true;
+    Serial.printf("Button %d pressed\n", pin);
+  }
+  prev = down;
+  return edge;
+}
+
+bool comboPressed() {
+  if (isDown(BTN_A) && isDown(BTN_B)) {
+    unsigned long now = millis();
+    if (now - lastComboSwitch > COMBO_COOLDOWN_MS) {
+      lastComboSwitch = now;
+      Serial.println("COMBO pressed");
+      while (isDown(BTN_A) || isDown(BTN_B)) delay(5);
+      prevA = prevB = false;
+      return true;
+    }
+  }
+  return false;
+}
+
+// =================== [ADDED] ESP-NOW SEND + 4-BUTTON COMBO ===================
+void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (len != sizeof(AckPacket)) return;
+  const AckPacket* a = (const AckPacket*)data;
+  if (a->magic != PKT_MAGIC || a->type != PKT_ACK || a->kitId != KIT_ID) return;
+  lastAckId  = a->transferId;
+  lastAckSeq = a->seq;
+}
+
+bool initEspNow() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  if (esp_now_init() != ESP_OK) { Serial.println("ESP-NOW init FAILED"); return false; }
+  esp_now_register_recv_cb(onEspNowRecv);
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, broadcastAddr, 6);
+  peer.channel = 0;
+  peer.encrypt = false;
+  if (esp_now_add_peer(&peer) != ESP_OK) { Serial.println("ESP-NOW add peer FAILED"); return false; }
+  Serial.println("ESP-NOW ready");
+  return true;
+}
+
+#define SEND_OK          0
+#define SEND_NOT_TRAINED 1
+#define SEND_NO_RADIO    2
+#define SEND_NO_ACK      3
+
+int sendWeights() {
+  if (countA == 0 || countB == 0) return SEND_NOT_TRAINED;
+  if (!espNowReady) return SEND_NO_RADIO;
+
+  // Read-only copy of the existing training state
+  txPayload.version = PROTO_VERSION;
+  txPayload.featLen = FEAT_LEN;
+  txPayload.countA  = countA;
+  txPayload.countB  = countB;
+  memcpy(txPayload.sumA, sumA, sizeof(sumA));
+  memcpy(txPayload.sumB, sumB, sizeof(sumB));
+
+  const uint8_t* buf = (const uint8_t*)&txPayload;
+  size_t total = sizeof(txPayload);
+  uint8_t nChunks = (total + CHUNK_DATA - 1) / CHUNK_DATA;
+  uint32_t crc = crc32(buf, total);
+  txTransferId++;
+  if (txTransferId == 0) txTransferId = 1;
+  unsigned long t0 = millis();
+
+  for (uint8_t seq = 0; seq < nChunks; seq++) {
+    ChunkPacket p;
+    p.magic = PKT_MAGIC; p.type = PKT_CHUNK; p.kitId = KIT_ID;
+    p.transferId = txTransferId; p.seq = seq; p.total = nChunks; p.crc = crc;
+    size_t off = (size_t)seq * CHUNK_DATA;
+    p.len = min((size_t)CHUNK_DATA, total - off);
+    memcpy(p.data, buf + off, p.len);
+
+    bool acked = false;
+    for (int attempt = 0; attempt < 5 && !acked; attempt++) {
+      lastAckSeq = -1;
+      esp_now_send(broadcastAddr, (uint8_t*)&p, sizeof(p));
+      unsigned long ts = millis();
+      while (millis() - ts < 50) {
+        if (lastAckId == txTransferId && lastAckSeq == seq) { acked = true; break; }
+        delay(1);
+      }
+    }
+    if (!acked) { Serial.printf("Send FAILED at chunk %d\n", seq); return SEND_NO_ACK; }
+  }
+  Serial.printf("Weights sent (A:%d B:%d) in %lu ms\n", countA, countB, millis() - t0);
+  return SEND_OK;
+}
+
+void drawStatusBox(const char* line1, const char* line2, uint16_t color) {
+  tft.fillRect(8, 56, SCR_W - 16, 48, COL_BG);
+  tft.drawRect(8, 56, SCR_W - 16, 48, color);
+  tft.setTextSize(1);
+  tft.setTextColor(color);
+  tft.setCursor(14, 66); tft.print(line1);
+  tft.setTextColor(COL_TEXT);
+  tft.setCursor(14, 82); tft.print(line2);
+}
+
+bool allFourDown() {
+  return isDown(BTN_A) && isDown(BTN_B) && isDown(BTN_TEST) && isDown(BTN_RESET);
+}
+
+// Same page switch the A+B combo does (used only for a very quick A+B tap)
+void switchPageFromCombo() {
+  currentPage = (currentPage == PAGE_HOME) ? PAGE_ML : PAGE_HOME;
+  if (currentPage == PAGE_ML) {
+    drawMLPage();
+  } else {
+    lastAx = -1;
+    drawHomeStatic();
+  }
+}
+
+// Returns true if it handled the buttons this loop (caller should return)
+bool handleSendCombo() {
+  // An action whose button was released was intentional - stop protecting it
+  if (undoArmed && !isDown(undoPin)) undoArmed = false;
+
+  // A+B down: give TEST and RESET a moment to join before the page-switch combo runs
+  if (isDown(BTN_A) && isDown(BTN_B) && !allFourDown()) {
+    unsigned long t0 = millis();
+    while (millis() - t0 < SEND_COMBO_WAIT_MS) {
+      if (allFourDown()) break;
+      if (!isDown(BTN_A) || !isDown(BTN_B)) {
+        // Quick A+B tap released during the wait: do the original page switch
+        if (millis() - lastComboSwitch > COMBO_COOLDOWN_MS) {
+          lastComboSwitch = millis();
+          Serial.println("COMBO pressed");
+          prevA = prevB = false;
+          switchPageFromCombo();
+          return true;
+        }
+        return false;
+      }
+      delay(5);
+    }
+  }
+
+  if (!allFourDown()) return false;
+
+  Serial.println("SEND COMBO pressed");
+  if (undoArmed) {
+    restoreSnapshot();
+    undoArmed = false;
+    Serial.println("Undid action triggered by the combo");
+  }
+
+  drawStatusBox("SENDING WEIGHTS", "to tester...", COL_ACCENT);
+  int r = sendWeights();
+  if (r == SEND_OK) {
+    char msg[20];
+    snprintf(msg, sizeof(msg), "A:%d  B:%d", countA, countB);
+    drawStatusBox("SENT TO TESTER!", msg, COL_GOOD);
+  } else if (r == SEND_NOT_TRAINED) {
+    drawStatusBox("NOTHING TO SEND", "train A and B", COL_BAD);
+  } else if (r == SEND_NO_RADIO) {
+    drawStatusBox("SEND FAILED", "radio error", COL_BAD);
+  } else {
+    drawStatusBox("SEND FAILED", "no tester found", COL_BAD);
+  }
+  delay(1500);
+
+  while (isDown(BTN_A) || isDown(BTN_B) || isDown(BTN_TEST) || isDown(BTN_RESET)) delay(5);
+  prevA = prevB = prevTest = prevReset = false;
+  lastComboSwitch = millis();
+
+  if (currentPage == PAGE_ML) {
+    drawMLPage();
+  } else {
+    lastAx = -1;
+    drawHomeStatic();
+  }
+  return true;
+}
+// =============================================================================
+
+// ----------------- SETUP / LOOP -----------------
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+  Serial.println("\nMiltalk CAMERA KIT (TFT + feedback)");
+
+  pinMode(BTN_A, INPUT_PULLUP);
+  pinMode(BTN_B, INPUT_PULLUP);
+  pinMode(BTN_TEST, INPUT_PULLUP);
+  pinMode(BTN_RESET, INPUT_PULLUP);
+
+  tft.initR(INITR_BLACKTAB);
+  tft.setSPISpeed(8000000);
+  tft.setRotation(0);
+  tft.fillScreen(COL_BG);
+
+  tft.setTextColor(COL_TEXT);
+  tft.setCursor(10, 70);
+  tft.print("Starting camera...");
+
+  if (!initCamera()) {
+    tft.fillScreen(ST77XX_RED);
+    tft.setCursor(8, 70);
+    tft.setTextColor(COL_TEXT);
+    tft.print("CAMERA FAIL");
+    tft.setCursor(8, 84);
+    tft.print("Check PSRAM=OPI");
+    while (true) delay(1000);
+  }
+  Serial.println("Camera ready.");
+
+  for (int i = 0; i < 10; i++) {
+    camera_fb_t* tmp = esp_camera_fb_get();
+    if (tmp) esp_camera_fb_return(tmp);
+    delay(30);
+  }
+
+  resetTraining();
+
+  espNowReady = initEspNow();   // [ADDED] kit still works normally if this fails
+
+  currentPage = PAGE_HOME;
+  drawHomeStatic();
+}
+
+void loop() {
+  if (handleSendCombo()) return;   // [ADDED] 4-button send (checked first)
+
+  if (comboPressed()) {
+    currentPage = (currentPage == PAGE_HOME) ? PAGE_ML : PAGE_HOME;
+    if (currentPage == PAGE_ML) {
+      drawMLPage();
+    } else {
+      lastAx = -1;
+      drawHomeStatic();
+    }
+    return;
+  }
+
+  if (currentPage == PAGE_HOME) {
+    animateHome();
+    delay(40);
+  } else {
+    bool changed = false;
+
+    if (feedbackMode) {
+      // In feedback mode: A = approve, B = disprove, TEST/RESET = skip
+      if (justPressed(BTN_A, prevA))         { armUndo(BTN_A);     handleApprove();  changed = true; }
+      if (justPressed(BTN_B, prevB))         { armUndo(BTN_B);     handleDisprove(); changed = true; }
+      if (justPressed(BTN_TEST, prevTest))   { armUndo(BTN_TEST);  feedbackMode = false; changed = true; }
+      if (justPressed(BTN_RESET, prevReset)) { armUndo(BTN_RESET); resetTraining();  changed = true; }
+    } else {
+      if (justPressed(BTN_A, prevA))         { armUndo(BTN_A);     trainExample(true);  changed = true; }
+      if (justPressed(BTN_B, prevB))         { armUndo(BTN_B);     trainExample(false); changed = true; }
+      if (justPressed(BTN_TEST, prevTest))   { armUndo(BTN_TEST);  testExample();       changed = true; }
+      if (justPressed(BTN_RESET, prevReset)) { armUndo(BTN_RESET); resetTraining();     changed = true; }
+    }
+
+    if (changed) drawMLPage();
+    delay(10);
+  }
+}
