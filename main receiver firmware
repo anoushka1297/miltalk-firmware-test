@@ -1,30 +1,27 @@
 /*
- * Miltalk CAMERA KIT - TESTER (receives weights, classifies, points servo)
- * Board: ESP32-S3 N16R8 CAM (onboard OV5640) - same PCB as the trainer
- * Display: ST7735 TFT, PORTRAIT
+ * Miltalk TESTER (receiver)
+ * Hardware: bare ESP32-S3 N16R8 CAM board (OV2640) on breadboard + servo.
+ *           No TFT, no PCB buttons.
  *
- * - Receives sumA/sumB/countA/countB from the trainer over ESP-NOW
+ * - Receives sumA/sumB/countA/countB from the trainer kit over ESP-NOW
  *   (trainer: hold all 4 buttons). Saved to flash, reloaded at boot.
- * - TEST button: capture -> classify (identical pipeline + nearest centroid)
- *   -> servo points to SET A or SET B for a few seconds -> back to centre.
+ * - BOOT button (or 't' over Serial): capture -> identical feature
+ *   extraction -> identical nearest-centroid decision -> servo points to
+ *   SET A or SET B for a few seconds -> back to centre.
  *
  * ARDUINO IDE SETTINGS:
  *   Board: ESP32S3 Dev Module | PSRAM: OPI PSRAM | Flash: 16MB
  *   Partition: Huge APP | USB CDC On Boot: Enabled
  *   esp32 board package 3.x
- * LIBRARIES: Adafruit GFX, Adafruit ST7735 and ST7789
  */
 
 #include "esp_camera.h"
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7735.h>
-#include <SPI.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <Preferences.h>
 #include "driver/ledc.h"
 
-// ----------------- CAMERA PIN MAP (identical to trainer) -----------------
+// ----------------- CAMERA PIN MAP (same as trainer PCB) -----------------
 #define PWDN_GPIO_NUM   -1
 #define RESET_GPIO_NUM  -1
 #define XCLK_GPIO_NUM   15
@@ -42,48 +39,25 @@
 #define HREF_GPIO_NUM    7
 #define PCLK_GPIO_NUM   13
 
-// ----------------- TFT PINS -----------------
-#define TFT_CS    40
-#define TFT_RST   41
-#define TFT_DC    42
-#define TFT_MOSI  39
-#define TFT_SCLK  38
-
-// ----------------- BUTTON PINS -----------------
-#define BTN_A     21
-#define BTN_B     47
-#define BTN_TEST  14
-#define BTN_RESET 1
+// ----------------- TRIGGER + STATUS LED -----------------
+#define BTN_TRIGGER  0        // BOOT button
+#define USE_RGB_LED  1        // set 0 if your board has no RGB LED
+#define RGB_LED_PIN  48
 
 // ----------------- SERVO -----------------
-#define SERVO_PIN      2      // <-- change if your PCB routes the servo elsewhere
-#define SERVO_CENTER   90     // rest position
-#define SERVO_SWING    45     // degrees either side of centre (safe range)
-#define SERVO_A_DEG    (SERVO_CENTER - SERVO_SWING)   // SET A
-#define SERVO_B_DEG    (SERVO_CENTER + SERVO_SWING)   // SET B
-#define SERVO_A_LABEL  "LEFT"   // swap labels/angles if mounted the other way
-#define SERVO_B_LABEL  "RIGHT"
-#define SERVO_HOLD_MS  3000   // how long it points before returning
-#define SERVO_SETTLE_MS 700   // then pulses stop (servo relaxes)
-#define SERVO_MIN_US   500
-#define SERVO_MAX_US   2400
-#define SERVO_LEDC_TIMER LEDC_TIMER_1      // camera uses TIMER_0 / CHANNEL_0
+#define SERVO_PIN       2
+#define SERVO_CENTER    90                              // rest position
+#define SERVO_SWING     45                              // safe range either side
+#define SERVO_A_DEG     (SERVO_CENTER - SERVO_SWING)    // SET A
+#define SERVO_B_DEG     (SERVO_CENTER + SERVO_SWING)    // SET B
+#define SERVO_A_LABEL   "LEFT"     // swap if mounted the other way
+#define SERVO_B_LABEL   "RIGHT"
+#define SERVO_HOLD_MS   3000       // how long it points before returning
+#define SERVO_SETTLE_MS 700        // then pulses stop (servo relaxes)
+#define SERVO_MIN_US    500
+#define SERVO_MAX_US    2400
+#define SERVO_LEDC_TIMER LEDC_TIMER_1    // camera uses TIMER_0 / CHANNEL_0
 #define SERVO_LEDC_CH    LEDC_CHANNEL_2
-
-// ----------------- DISPLAY -----------------
-Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
-#define SCR_W 128
-#define SCR_H 160
-
-#define COL_BG      0x18E3
-#define COL_ACCENT  0x055A
-#define COL_A       0x4A5F
-#define COL_B       0x05B4
-#define COL_TEST    0xFCA0
-#define COL_TEXT    0xFFFF
-#define COL_MUTE    0x8C71
-#define COL_GOOD    0x07E0
-#define COL_BAD     0xF800
 
 // ----------------- CLASSIFIER CONFIG (identical) -----------------
 #define FEAT_W 16
@@ -95,10 +69,6 @@ float sumA[FEAT_LEN];
 float sumB[FEAT_LEN];
 int   countA = 0;
 int   countB = 0;
-
-String lastPrediction = "-";
-int    lastConfidence  = 0;
-const char* lastDirection = "";
 
 // =================== ESP-NOW PROTOCOL (same as trainer) ===================
 #define KIT_ID        1
@@ -137,7 +107,6 @@ uint32_t crc32(const uint8_t* d, size_t n) {
 
 uint8_t broadcastAddr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-// Reassembly state (written in the ESP-NOW callback)
 uint8_t  rxBuf[sizeof(WeightsPayload)];
 bool     gotChunk[16];
 uint8_t  rxId = 0, rxTotal = 0;
@@ -146,14 +115,24 @@ volatile bool transferDone = false;
 
 Preferences prefs;
 
-// ----------------- BUTTON STATE -----------------
-unsigned long lastPress[49] = {0};
+// ----------------- STATE -----------------
+unsigned long lastPress = 0;
 const unsigned long DEBOUNCE_MS = 250;
-bool prevTest = false;
-
-// ----------------- SERVO STATE -----------------
+bool prevTrigger = false;
 unsigned long servoReturnAt = 0;
 unsigned long servoRelaxAt = 0;
+
+// ----------------- STATUS LED -----------------
+void ledColor(uint8_t r, uint8_t g, uint8_t b) {
+#if USE_RGB_LED
+  rgbLedWrite(RGB_LED_PIN, r, g, b);
+#endif
+}
+
+void ledIdle() {
+  if (countA > 0 && countB > 0) ledColor(0, 15, 0);   // dim green = ready
+  else                          ledColor(15, 0, 0);   // dim red = no weights
+}
 
 // ----------------- CAMERA INIT (identical) -----------------
 bool initCamera() {
@@ -204,34 +183,9 @@ bool initCamera() {
   return true;
 }
 
-// ----------------- CAPTURE PREVIEW (identical) -----------------
-void drawFramePreview(camera_fb_t* fb) {
-  int srcW = fb->width, srcH = fb->height;
-  uint8_t* px = fb->buf;
-
-  int dstW = SCR_W;
-  int dstH = (srcH * dstW) / srcW;
-  int offsetY = (SCR_H - dstH) / 2;
-
-  tft.fillScreen(ST77XX_BLACK);
-
-  for (int dy = 0; dy < dstH; dy++) {
-    for (int dx = 0; dx < dstW; dx++) {
-      int sx = (dx * srcW) / dstW;
-      int sy = (dy * srcH) / dstH;
-      uint8_t g = px[sy * srcW + sx];
-      uint16_t color = ((g & 0xF8) << 8) | ((g & 0xFC) << 3) | (g >> 3);
-      tft.drawPixel(dx, offsetY + dy, color);
-    }
-  }
-
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setTextSize(1);
-  tft.setCursor(4, 4);
-  tft.print("captured");
-}
-
-// ----------------- FEATURE EXTRACTION (identical) -----------------
+// ----------------- FEATURE EXTRACTION -----------------
+// Identical math to the trainer. Only the TFT preview (+ its 2 s hold) is
+// removed - it ran after the features were computed, so results are unchanged.
 bool captureFeatures(float* out) {
   for (int i = 0; i < 3; i++) {
     camera_fb_t* tmp = esp_camera_fb_get();
@@ -260,8 +214,6 @@ bool captureFeatures(float* out) {
       out[fy * FEAT_W + fx] = avg / 255.0f;
     }
   }
-  drawFramePreview(fb);
-  delay(2000);
   esp_camera_fb_return(fb);
 
   float mean = 0;
@@ -283,7 +235,7 @@ float distToCentroid(const float* feat, const float* sum, int count) {
   return sqrt(d);
 }
 
-// ----------------- SERVO (direct LEDC, timer 1 / channel 2) -----------------
+// ----------------- SERVO (direct LEDC, own timer/channel) -----------------
 bool servoInit() {
   ledc_timer_config_t t = {};
   t.speed_mode      = LEDC_LOW_SPEED_MODE;
@@ -312,7 +264,7 @@ void servoWriteDeg(int deg) {
   ledc_update_duty(LEDC_LOW_SPEED_MODE, SERVO_LEDC_CH);
 }
 
-void servoOff() {   // stop pulses: servo relaxes, no straining/current draw
+void servoOff() {   // stop pulses: no straining, no holding current
   ledc_set_duty(LEDC_LOW_SPEED_MODE, SERVO_LEDC_CH, 0);
   ledc_update_duty(LEDC_LOW_SPEED_MODE, SERVO_LEDC_CH);
 }
@@ -320,54 +272,6 @@ void servoOff() {   // stop pulses: servo relaxes, no straining/current draw
 void servoGoTo(int deg) {
   servoWriteDeg(deg);
   servoRelaxAt = millis() + SERVO_SETTLE_MS;
-}
-
-// ----------------- DISPLAY -----------------
-void drawStatusBox(const char* line1, const char* line2, uint16_t color) {
-  tft.fillRect(8, 56, SCR_W - 16, 48, COL_BG);
-  tft.drawRect(8, 56, SCR_W - 16, 48, color);
-  tft.setTextSize(1);
-  tft.setTextColor(color);
-  tft.setCursor(14, 66); tft.print(line1);
-  tft.setTextColor(COL_TEXT);
-  tft.setCursor(14, 82); tft.print(line2);
-}
-
-void drawTesterPage() {
-  tft.fillScreen(COL_BG);
-  tft.fillRect(0, 0, SCR_W, 18, COL_ACCENT);
-  tft.setTextColor(COL_TEXT);
-  tft.setTextSize(1);
-  tft.setCursor(6, 5);
-  tft.print("TESTER KIT");
-
-  if (countA > 0 && countB > 0) {
-    tft.setTextColor(COL_A); tft.setCursor(6, 28); tft.print("SET A: "); tft.print(countA);
-    tft.setTextColor(COL_B); tft.setCursor(6, 42); tft.print("SET B: "); tft.print(countB);
-  } else {
-    tft.setTextColor(COL_BAD);  tft.setCursor(6, 28); tft.print("NO WEIGHTS");
-    tft.setTextColor(COL_MUTE); tft.setCursor(6, 42); tft.print("send from trainer");
-  }
-
-  tft.drawRect(6, 62, SCR_W - 12, 56, COL_MUTE);
-  tft.setTextColor(COL_MUTE);
-  tft.setCursor(12, 68);
-  tft.print("PREDICTION");
-  tft.setTextColor(COL_TEXT);
-  tft.setTextSize(2);
-  tft.setCursor(12, 80);
-  tft.print(lastPrediction);
-  tft.setTextSize(1);
-  tft.setTextColor(COL_ACCENT);
-  tft.setCursor(12, 98);
-  tft.print(lastConfidence); tft.print("% conf");
-  tft.setTextColor(COL_TEXT);
-  tft.setCursor(12, 108);
-  tft.print(lastDirection);
-
-  tft.setTextColor(COL_TEST);
-  tft.setCursor(6, 132);
-  tft.print("TEST = classify");
 }
 
 // ----------------- WEIGHTS STORAGE -----------------
@@ -451,28 +355,27 @@ void handleIncomingWeights() {
 
   applyPayload(w);
   saveWeights(w);
-  lastPrediction = "-"; lastConfidence = 0; lastDirection = "";
-  Serial.printf("Weights received (A:%d B:%d) - saved\n", countA, countB);
+  Serial.printf("Weights received (A:%d B:%d) - saved to flash\n", countA, countB);
 
-  drawTesterPage();
-  char msg[20];
-  snprintf(msg, sizeof(msg), "A:%d  B:%d", countA, countB);
-  drawStatusBox("WEIGHTS RECEIVED", msg, COL_GOOD);
-  delay(1500);
-  drawTesterPage();
+  for (int i = 0; i < 3; i++) {             // 3 green flashes
+    ledColor(0, 60, 0); delay(150);
+    ledColor(0, 0, 0);  delay(150);
+  }
+  ledIdle();
 }
 
 // ----------------- CLASSIFY + POINT -----------------
 void classifyAndPoint() {
   if (countA == 0 || countB == 0) {
-    drawStatusBox("NO WEIGHTS YET", "send from trainer", COL_BAD);
-    delay(1500);
-    drawTesterPage();
+    Serial.println("No weights yet - send from the trainer (hold all 4 buttons)");
+    for (int i = 0; i < 2; i++) { ledColor(60, 0, 0); delay(200); ledColor(0, 0, 0); delay(200); }
+    ledIdle();
     return;
   }
 
+  ledColor(0, 0, 40);                        // blue = capturing
   float feat[FEAT_LEN];
-  if (!captureFeatures(feat)) { drawTesterPage(); return; }
+  if (!captureFeatures(feat)) { ledIdle(); return; }
 
   // Identical decision + confidence to the trainer's testExample()
   float dA = distToCentroid(feat, sumA, countA);
@@ -481,28 +384,26 @@ void classifyAndPoint() {
   float nr = aWins ? dA : dB;
   float fr = aWins ? dB : dA;
   float conf = (fr + nr > 0) ? (fr - nr) / (fr + nr) * 100.0f : 0;
-  lastPrediction = aWins ? "SET A" : "SET B";
-  lastConfidence = (int)conf;
-  lastDirection  = aWins ? "-> " SERVO_A_LABEL : "-> " SERVO_B_LABEL;
-  Serial.printf("Predict %s (%.0f%%) %s\n", lastPrediction.c_str(), conf, lastDirection);
 
-  drawTesterPage();
+  Serial.printf("Predict %s (%.0f%%) -> servo %s\n",
+                aWins ? "SET A" : "SET B", conf,
+                aWins ? SERVO_A_LABEL : SERVO_B_LABEL);
+
   servoGoTo(aWins ? SERVO_A_DEG : SERVO_B_DEG);
   servoReturnAt = millis() + SERVO_HOLD_MS;
+  ledIdle();
 }
 
-// ----------------- BUTTONS -----------------
-bool isDown(int pin) { return digitalRead(pin) == LOW; }
-
-bool justPressed(int pin, bool &prev) {
-  bool down = isDown(pin);
+// ----------------- TRIGGER -----------------
+bool triggerPressed() {
+  bool down = digitalRead(BTN_TRIGGER) == LOW;
   bool edge = false;
   unsigned long now = millis();
-  if (down && !prev && (now - lastPress[pin] > DEBOUNCE_MS)) {
-    lastPress[pin] = now;
+  if (down && !prevTrigger && (now - lastPress > DEBOUNCE_MS)) {
+    lastPress = now;
     edge = true;
   }
-  prev = down;
+  prevTrigger = down;
   return edge;
 }
 
@@ -510,29 +411,14 @@ bool justPressed(int pin, bool &prev) {
 void setup() {
   Serial.begin(115200);
   delay(1500);
-  Serial.println("\nMiltalk TESTER KIT");
+  Serial.println("\nMiltalk TESTER (receiver)");
 
-  pinMode(BTN_A, INPUT_PULLUP);
-  pinMode(BTN_B, INPUT_PULLUP);
-  pinMode(BTN_TEST, INPUT_PULLUP);
-  pinMode(BTN_RESET, INPUT_PULLUP);
-
-  tft.initR(INITR_BLACKTAB);
-  tft.setSPISpeed(8000000);
-  tft.setRotation(0);
-  tft.fillScreen(COL_BG);
-
-  tft.setTextColor(COL_TEXT);
-  tft.setCursor(10, 70);
-  tft.print("Starting camera...");
+  pinMode(BTN_TRIGGER, INPUT_PULLUP);
+  ledColor(0, 0, 0);
 
   if (!initCamera()) {
-    tft.fillScreen(ST77XX_RED);
-    tft.setCursor(8, 70);
-    tft.setTextColor(COL_TEXT);
-    tft.print("CAMERA FAIL");
-    tft.setCursor(8, 84);
-    tft.print("Check PSRAM=OPI");
+    Serial.println("CAMERA FAIL - check PSRAM=OPI and the camera pin map");
+    ledColor(60, 0, 0);
     while (true) delay(1000);
   }
   Serial.println("Camera ready.");
@@ -543,20 +429,22 @@ void setup() {
     delay(30);
   }
 
-  // Servo after camera, on its own LEDC timer/channel
-  if (servoInit()) servoGoTo(SERVO_CENTER);
+  if (servoInit()) servoGoTo(SERVO_CENTER);   // after camera, own timer
 
   if (loadWeights()) Serial.printf("Loaded saved weights (A:%d B:%d)\n", countA, countB);
   else               Serial.println("No saved weights - waiting for trainer");
 
   initEspNow();
-  drawTesterPage();
+  ledIdle();
+  Serial.println("Ready. Place object, press BOOT (or type 't').");
 }
 
 void loop() {
   handleIncomingWeights();
 
-  if (justPressed(BTN_TEST, prevTest)) classifyAndPoint();
+  bool trigger = triggerPressed();
+  if (Serial.available() && Serial.read() == 't') trigger = true;
+  if (trigger) classifyAndPoint();
 
   if (servoReturnAt && millis() >= servoReturnAt) {
     servoReturnAt = 0;
